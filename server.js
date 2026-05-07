@@ -35,8 +35,12 @@ const buckets = {
   F_A: new Set()  // Females seeking Any
 };
 
-const userRegistry = new Map(); // socketId -> { userData, timeout, currentBucket }
-const rooms = new Map();         // roomId -> [socketIds]
+const userRegistry = new Map();   // deviceId -> { userData, timeout, currentBucket, roomId, isOnline }
+const rooms = new Map();          // roomId -> { members: [deviceId1, deviceId2], cleanupTimer }
+const socketToDevice = new Map(); // socketId -> deviceId
+const deviceToSocket = new Map(); // deviceId -> socketId
+
+const DISCONNECT_GRACE_PERIOD = 30000; // 30 seconds
 
 // ---------------- Helper Functions ----------------
 const timeoutMessages = {
@@ -60,19 +64,21 @@ function getRandomMessage(type) {
 }
 
 function getBucketKey(gender, preference) {
+  if (!gender || !preference) return "M_A";
   const g = gender.toUpperCase().charAt(0);
   const p = preference.toUpperCase().charAt(0);
   return `${g}_${p}`;
 }
 
-function removeFromAllBuckets(socketId) {
-  const user = userRegistry.get(socketId);
+function removeFromAllBuckets(deviceId) {
+  const user = userRegistry.get(deviceId);
   if (user && user.currentBucket) {
-    buckets[user.currentBucket].delete(socketId);
+    buckets[user.currentBucket].delete(deviceId);
+    user.currentBucket = null;
   }
 }
 
-function findMatch(socket, userData) {
+function findMatch(socket, userData, deviceId) {
   const { gender, preference } = userData;
   const myBucket = getBucketKey(gender, preference);
   
@@ -90,44 +96,59 @@ function findMatch(socket, userData) {
     const bucket = buckets[bucketKey];
     if (bucket && bucket.size > 0) {
       // Get the first available partner
-      const partnerId = bucket.values().next().value;
-      if (partnerId === socket.id) continue;
+      const partnerDeviceId = bucket.values().next().value;
+      if (partnerDeviceId === deviceId) continue;
 
-      const partner = userRegistry.get(partnerId);
-      if (partner) {
+      const partner = userRegistry.get(partnerDeviceId);
+      const partnerSocketId = deviceToSocket.get(partnerDeviceId);
+      const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+
+      if (partner && partnerSocket) {
         // --- MATCH FOUND ---
         // Atomic removal
-        bucket.delete(partnerId);
-        removeFromAllBuckets(socket.id);
+        bucket.delete(partnerDeviceId);
+        removeFromAllBuckets(deviceId);
         
         clearTimeout(partner.timeout);
+        partner.timeout = null;
         
         const roomId = crypto.randomUUID();
-        const partnerSocket = io.sockets.sockets.get(partnerId);
 
-        if (partnerSocket) {
-          socket.join(roomId);
-          partnerSocket.join(roomId);
-          rooms.set(roomId, [socket.id, partnerId]);
+        socket.join(roomId);
+        partnerSocket.join(roomId);
+        
+        rooms.set(roomId, { members: [deviceId, partnerDeviceId], cleanupTimer: null });
+        
+        // Update registry
+        const me = userRegistry.get(deviceId);
+        if (me) me.roomId = roomId;
+        partner.roomId = roomId;
 
-          const matchDataForA = {
-            status: "match_found",
-            roomId,
-            partner: { name: partner.userData.name, gender: partner.userData.gender, userId: partnerId }
-          };
+        const matchDataForA = {
+          status: "match_found",
+          roomId,
+          partner: { 
+            name: partner.userData.name, 
+            gender: partner.userData.gender, 
+            deviceId: partnerDeviceId 
+          }
+        };
 
-          const matchDataForB = {
-            status: "match_found",
-            roomId,
-            partner: { name: userData.name, gender: userData.gender, userId: socket.id }
-          };
+        const matchDataForB = {
+          status: "match_found",
+          roomId,
+          partner: { 
+            name: userData.name, 
+            gender: userData.gender, 
+            deviceId: deviceId 
+          }
+        };
 
-          socket.emit("status", matchDataForA);
-          partnerSocket.emit("status", matchDataForB);
+        socket.emit("status", matchDataForA);
+        partnerSocket.emit("status", matchDataForB);
 
-          console.log(`✅ Match: ${userData.name} <-> ${partner.userData.name} [Room: ${roomId}]`);
-          return true;
-        }
+        console.log(`✅ Match: ${userData.name} <-> ${partner.userData.name} [Room: ${roomId}]`);
+        return true;
       }
     }
   }
@@ -136,40 +157,98 @@ function findMatch(socket, userData) {
 
 // ---------------- Socket Events ----------------
 io.on("connection", (socket) => {
-  console.log(`🔌 Connected: ${socket.id}`);
+  const deviceId = socket.handshake.query.deviceId || socket.handshake.auth.deviceId;
+  
+  if (!deviceId) {
+    console.log(`⚠️ Connection without Device ID: ${socket.id}`);
+    socket.disconnect();
+    return;
+  }
+
+  console.log(`🔌 Connected: ${socket.id} (Device: ${deviceId})`);
+  
+  // Cleanup old socket association if any
+  const oldSocketId = deviceToSocket.get(deviceId);
+  if (oldSocketId && oldSocketId !== socket.id) {
+    const oldSocket = io.sockets.sockets.get(oldSocketId);
+    if (oldSocket) oldSocket.disconnect();
+  }
+
+  socketToDevice.set(socket.id, deviceId);
+  deviceToSocket.set(deviceId, socket.id);
+
+  // Re-join active room if exists
+  const user = userRegistry.get(deviceId);
+  if (user) {
+    user.isOnline = true;
+    if (user.roomId && rooms.has(user.roomId)) {
+      const room = rooms.get(user.roomId);
+      socket.join(user.roomId);
+      
+      // Clear cleanup timer as one member is back
+      if (room.cleanupTimer) {
+        console.log(`⏳ Cancelling room cleanup for ${user.roomId}`);
+        clearTimeout(room.cleanupTimer);
+        room.cleanupTimer = null;
+      }
+
+      console.log(`🔗 Reconnected ${deviceId} to active room: ${user.roomId}`);
+      socket.emit("room_restored", { roomId: user.roomId });
+      socket.to(user.roomId).emit("chat_response", { status: "partner_connected", message: "Partner is back online." });
+    }
+  }
 
   socket.on("join_room", (data) => {
     const { roomId } = data;
     if (roomId && rooms.has(roomId)) {
       socket.join(roomId);
-      console.log(`🔗 ${socket.id} joined/rejoined room: ${roomId}`);
     }
   });
 
   socket.on("find", (data) => {
-    console.log(`🔍 Search: ${socket.id} (${data.gender} -> ${data.preference})`);
+    const deviceId = socketToDevice.get(socket.id);
+    if (!deviceId) return;
 
-    // Clean up existing search
-    if (userRegistry.has(socket.id)) {
-      clearTimeout(userRegistry.get(socket.id).timeout);
-      removeFromAllBuckets(socket.id);
+    console.log(`🔍 Search: ${deviceId} (${data.gender} -> ${data.preference})`);
+
+    // Clean up existing search or room
+    if (userRegistry.has(deviceId)) {
+      const existing = userRegistry.get(deviceId);
+      if (existing.timeout) clearTimeout(existing.timeout);
+      removeFromAllBuckets(deviceId);
+      
+      // If they were in a room, they are choosing to leave it
+      if (existing.roomId) {
+        const roomId = existing.roomId;
+        socket.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner started a new search." });
+        rooms.delete(roomId);
+        existing.roomId = null;
+      }
+    } else {
+      userRegistry.set(deviceId, { userData: data, isOnline: true });
     }
 
-    const matched = findMatch(socket, data);
+    const matched = findMatch(socket, data, deviceId);
 
     if (!matched) {
       const bucketKey = getBucketKey(data.gender, data.preference);
       const timeout = setTimeout(() => {
-        if (userRegistry.has(socket.id)) {
-          removeFromAllBuckets(socket.id);
-          userRegistry.delete(socket.id);
-          const msg = getRandomMessage(data.preference !== "any" ? "paid" : "free");
-          socket.emit("status", { status: "timeout", message: msg });
+        if (userRegistry.has(deviceId)) {
+          removeFromAllBuckets(deviceId);
+          const user = userRegistry.get(deviceId);
+          if (user) {
+            user.timeout = null;
+            const msg = getRandomMessage(data.preference !== "any" ? "paid" : "free");
+            socket.emit("status", { status: "timeout", message: msg });
+          }
         }
       }, 30000);
 
-      buckets[bucketKey].add(socket.id);
-      userRegistry.set(socket.id, { userData: data, timeout, currentBucket: bucketKey });
+      buckets[bucketKey].add(deviceId);
+      const user = userRegistry.get(deviceId);
+      user.userData = data;
+      user.timeout = timeout;
+      user.currentBucket = bucketKey;
       socket.emit("status", { status: "searching", message: "Searching for a partner..." });
     }
   });
@@ -180,6 +259,7 @@ io.on("connection", (socket) => {
       io.to(roomId).emit("chat_response", {
         ...data,
         from: socket.id,
+        fromDeviceId: socketToDevice.get(socket.id),
         timestamp: new Date().toISOString()
       });
     }
@@ -193,38 +273,69 @@ io.on("connection", (socket) => {
     if (data.roomId) socket.to(data.roomId).emit("stop_typing", { from: socket.id });
   });
 
-  socket.on("mark_read", (data) => {
-    if (data.roomId) socket.to(data.roomId).emit("receipt_read", { from: socket.id });
-  });
-
   socket.on("leave_chat", (data) => {
+    const deviceId = socketToDevice.get(socket.id);
     const roomId = data?.roomId;
     if (roomId && rooms.has(roomId)) {
       socket.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner left the chat." });
       io.in(roomId).socketsLeave(roomId);
       rooms.delete(roomId);
     }
-    removeFromAllBuckets(socket.id);
-    userRegistry.delete(socket.id);
+    if (deviceId) {
+      const user = userRegistry.get(deviceId);
+      if (user) {
+        removeFromAllBuckets(deviceId);
+        user.roomId = null;
+      }
+    }
   });
 
   socket.on("disconnect", () => {
-    console.log(`❌ Disconnected: ${socket.id}`);
+    const deviceId = socketToDevice.get(socket.id);
+    if (!deviceId) return;
+
+    console.log(`❌ Disconnected: ${socket.id} (Device: ${deviceId})`);
     
-    // Notify partners in active rooms
-    for (const [roomId, members] of rooms) {
-      if (members.includes(socket.id)) {
-        socket.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner disconnected." });
-        io.in(roomId).socketsLeave(roomId);
-        rooms.delete(roomId);
+    const user = userRegistry.get(deviceId);
+    if (user) {
+      user.isOnline = false;
+      
+      // If searching, stop it
+      if (user.currentBucket) {
+        removeFromAllBuckets(deviceId);
+        if (user.timeout) clearTimeout(user.timeout);
+        user.timeout = null;
+      }
+
+      // If in a room, start grace period
+      if (user.roomId && rooms.has(user.roomId)) {
+        const roomId = user.roomId;
+        const room = rooms.get(roomId);
+        
+        console.log(`⏱️ Starting ${DISCONNECT_GRACE_PERIOD}ms grace period for room ${roomId}`);
+        
+        socket.to(roomId).emit("chat_response", { 
+          status: "partner_away", 
+          message: "Partner disconnected. Waiting for reconnection..." 
+        });
+
+        // Set a timer to cleanup the room
+        room.cleanupTimer = setTimeout(() => {
+          console.log(`🧹 Grace period expired. Cleaning up room ${roomId}`);
+          io.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner left the chat." });
+          rooms.delete(roomId);
+          
+          // Clear room ID for both members
+          room.members.forEach(mId => {
+            const u = userRegistry.get(mId);
+            if (u) u.roomId = null;
+          });
+        }, DISCONNECT_GRACE_PERIOD);
       }
     }
 
-    if (userRegistry.has(socket.id)) {
-      clearTimeout(userRegistry.get(socket.id).timeout);
-      removeFromAllBuckets(socket.id);
-      userRegistry.delete(socket.id);
-    }
+    socketToDevice.delete(socket.id);
+    deviceToSocket.delete(deviceId);
   });
 });
 
