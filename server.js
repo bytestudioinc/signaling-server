@@ -193,7 +193,18 @@ io.on("connection", (socket) => {
       }
 
       console.log(`🔗 Reconnected ${deviceId} to active room: ${user.roomId}`);
-      socket.emit("room_restored", { roomId: user.roomId });
+      
+      const partnerId = room.members.find(id => id !== deviceId);
+      const partner = userRegistry.get(partnerId);
+      
+      socket.emit("room_restored", { 
+        roomId: user.roomId,
+        partner: partner ? {
+          name: partner.userData.name,
+          gender: partner.userData.gender,
+          deviceId: partnerId
+        } : null
+      });
       socket.to(user.roomId).emit("chat_response", { status: "partner_connected", message: "Partner is back online." });
     }
   }
