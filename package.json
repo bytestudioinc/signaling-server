@@ -1,15 +1,15 @@
 {
-  "name": "peerjs-server",
+  "name": "socket-io-server",
   "version": "1.0.0",
-  "description": "Self-hosted PeerJS signaling server on Render",
+  "description": "High-performance anonymous matching server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
-    "peer": "^1.0.0"
-  },
-  "engines": {
-    "node": ">=16"
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
   }
 }
