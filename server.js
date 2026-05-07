@@ -138,6 +138,14 @@ function findMatch(socket, userData) {
 io.on("connection", (socket) => {
   console.log(`🔌 Connected: ${socket.id}`);
 
+  socket.on("join_room", (data) => {
+    const { roomId } = data;
+    if (roomId && rooms.has(roomId)) {
+      socket.join(roomId);
+      console.log(`🔗 ${socket.id} joined/rejoined room: ${roomId}`);
+    }
+  });
+
   socket.on("find", (data) => {
     console.log(`🔍 Search: ${socket.id} (${data.gender} -> ${data.preference})`);
 
