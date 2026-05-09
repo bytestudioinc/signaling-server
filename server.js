@@ -296,7 +296,26 @@ io.on("connection", (socket) => {
       const user = userRegistry.get(deviceId);
       if (user) {
         removeFromAllBuckets(deviceId);
+        if (user.timeout) {
+          clearTimeout(user.timeout);
+          user.timeout = null;
+        }
         user.roomId = null;
+      }
+    }
+  });
+
+  socket.on("cancel_search", () => {
+    const deviceId = socketToDevice.get(socket.id);
+    if (!deviceId) return;
+
+    console.log(`⏹️ Cancel Search: ${deviceId}`);
+    const user = userRegistry.get(deviceId);
+    if (user) {
+      removeFromAllBuckets(deviceId);
+      if (user.timeout) {
+        clearTimeout(user.timeout);
+        user.timeout = null;
       }
     }
   });
