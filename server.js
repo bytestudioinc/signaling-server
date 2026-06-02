@@ -39,13 +39,15 @@ io.use(async (socket, next) => {
   }
 
   const jwtSecret = process.env.SUPABASE_JWT_SECRET;
-  if (!jwtSecret) {
-    console.warn("⚠️ SUPABASE_JWT_SECRET is missing. JWT authentication is skipped.");
+
+  // Skip JWT verification if neither database client nor local secret is set (dev fallback)
+  if (!supabase && !jwtSecret) {
+    console.warn("⚠️ Neither Supabase URL/Service Key nor SUPABASE_JWT_SECRET is configured. JWT verification skipped.");
     return next();
-  } else {
-    if (jwtSecret.trim().startsWith("eyJ")) {
-      console.error("❌ CRITICAL CONFIG ERROR: Your SUPABASE_JWT_SECRET environment variable is set to a JWT token (like the Anon Key or Service Role Key) instead of the actual raw JWT Secret from the Supabase Settings API tab.");
-    }
+  }
+
+  if (jwtSecret && jwtSecret.trim().startsWith("eyJ")) {
+    console.error("❌ CRITICAL CONFIG ERROR: Your SUPABASE_JWT_SECRET environment variable seems to be set to a JWT token (like the Anon Key or Service Role Key) instead of the actual raw JWT Secret from the Supabase Settings API tab.");
   }
 
   if (!token) {
@@ -62,11 +64,23 @@ io.use(async (socket, next) => {
       console.warn(`⚠️ [Auth Debug] Device ${deviceId} sent a completely unparseable token string.`);
     }
 
-    // 1. Verify JWT signature & expiration restricting to HS256 (Supabase default)
-    const decoded = jwt.verify(token, jwtSecret, { algorithms: ["HS256"] });
-    const authId = decoded.sub;
+    let authId = null;
 
-    // 2. Optional DB ownership check
+    if (supabase) {
+      // 1. Verify token securely using Supabase auth service (supports ES256, HS256, etc.)
+      const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+      if (authError || !user) {
+        console.log(`❌ Auth rejection: Supabase getUser validation failed for device ${deviceId}:`, authError?.message);
+        return next(new Error("Authentication error: Invalid or expired token"));
+      }
+      authId = user.id;
+    } else {
+      // Fallback: Verify JWT signature & expiration locally (only supports HS256 symmetric signing)
+      const decoded = jwt.verify(token, jwtSecret, { algorithms: ["HS256"] });
+      authId = decoded.sub;
+    }
+
+    // 2. DB ownership check
     if (supabase) {
       const { data, error } = await supabase
         .from("profiles")
