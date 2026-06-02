@@ -3,6 +3,20 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+const { createClient } = require("@supabase/supabase-js");
+
+// Initialize Supabase Client for DB cross-reference
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+let supabase = null;
+if (supabaseUrl && supabaseServiceKey) {
+  supabase = createClient(supabaseUrl, supabaseServiceKey);
+  console.log("✅ Supabase service client initialized on socket server.");
+} else {
+  console.warn("⚠️ Supabase URL or Service Role Key missing. Database validation skipped.");
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -12,6 +26,55 @@ const io = new Server(server, {
     origin: process.env.CORS_ORIGIN || "*",
     methods: ["GET", "POST"],
     credentials: true
+  }
+});
+
+// Middleware for JWT Authentication & Device Ownership verification
+io.use(async (socket, next) => {
+  const deviceId = socket.handshake.query.deviceId || socket.handshake.auth.deviceId;
+  const token = socket.handshake.auth.token;
+
+  if (!deviceId) {
+    return next(new Error("Authentication error: Device ID missing"));
+  }
+
+  const jwtSecret = process.env.SUPABASE_JWT_SECRET;
+  if (!jwtSecret) {
+    console.warn("⚠️ SUPABASE_JWT_SECRET is missing. JWT authentication is skipped.");
+    return next();
+  }
+
+  if (!token) {
+    console.log(`❌ Auth rejection: Missing token for device ${deviceId}`);
+    return next(new Error("Authentication error: JWT token missing"));
+  }
+
+  try {
+    // 1. Verify JWT signature & expiration
+    const decoded = jwt.verify(token, jwtSecret);
+    const authId = decoded.sub;
+
+    // 2. Optional DB ownership check
+    if (supabase) {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("id", deviceId)
+        .eq("auth_id", authId)
+        .maybeSingle();
+
+      if (error || !data) {
+        console.log(`❌ Auth rejection: Device ownership mismatch for device: ${deviceId}, authId: ${authId}`);
+        return next(new Error("Authentication error: Device ownership mismatch"));
+      }
+    }
+
+    // Attach verified properties to socket
+    socket.authId = authId;
+    next();
+  } catch (err) {
+    console.log(`❌ JWT verification failed for device ${deviceId}:`, err.message);
+    return next(new Error("Authentication error: Invalid or expired token"));
   }
 });
 
@@ -40,7 +103,7 @@ const rooms = new Map();          // roomId -> { members: [deviceId1, deviceId2]
 const socketToDevice = new Map(); // socketId -> deviceId
 const deviceToSocket = new Map(); // deviceId -> socketId
 
-const DISCONNECT_GRACE_PERIOD = 30000; // 30 seconds
+const DISCONNECT_GRACE_PERIOD = 60000; // 60 seconds (1 minute)
 
 // ---------------- Helper Functions ----------------
 const timeoutMessages = {
@@ -213,6 +276,7 @@ io.on("connection", (socket) => {
     const { roomId } = data;
     if (roomId && rooms.has(roomId)) {
       socket.join(roomId);
+      console.log(`👤 Socket ${socket.id} joined room ${roomId}`);
     }
   });
 
@@ -277,11 +341,17 @@ io.on("connection", (socket) => {
   });
 
   socket.on("typing", (data) => {
-    if (data.roomId) socket.to(data.roomId).emit("typing", { from: socket.id });
+    if (data.roomId) {
+      const deviceId = socketToDevice.get(socket.id);
+      socket.to(data.roomId).emit("typing", { from: socket.id, deviceId });
+    }
   });
 
   socket.on("stop_typing", (data) => {
-    if (data.roomId) socket.to(data.roomId).emit("stop_typing", { from: socket.id });
+    if (data.roomId) {
+      const deviceId = socketToDevice.get(socket.id);
+      socket.to(data.roomId).emit("stop_typing", { from: socket.id, deviceId });
+    }
   });
 
   socket.on("leave_chat", (data) => {
