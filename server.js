@@ -42,6 +42,10 @@ io.use(async (socket, next) => {
   if (!jwtSecret) {
     console.warn("⚠️ SUPABASE_JWT_SECRET is missing. JWT authentication is skipped.");
     return next();
+  } else {
+    if (jwtSecret.trim().startsWith("eyJ")) {
+      console.error("❌ CRITICAL CONFIG ERROR: Your SUPABASE_JWT_SECRET environment variable is set to a JWT token (like the Anon Key or Service Role Key) instead of the actual raw JWT Secret from the Supabase Settings API tab.");
+    }
   }
 
   if (!token) {
@@ -50,8 +54,16 @@ io.use(async (socket, next) => {
   }
 
   try {
-    // 1. Verify JWT signature & expiration
-    const decoded = jwt.verify(token, jwtSecret);
+    // Decode token for diagnostic logging
+    const parsed = jwt.decode(token, { complete: true });
+    if (parsed) {
+      console.log(`ℹ️ [Auth Debug] Device ${deviceId} sent token. Alg: ${parsed.header?.alg}, Sub/User ID: ${parsed.payload?.sub}, Role: ${parsed.payload?.role}`);
+    } else {
+      console.warn(`⚠️ [Auth Debug] Device ${deviceId} sent a completely unparseable token string.`);
+    }
+
+    // 1. Verify JWT signature & expiration restricting to HS256 (Supabase default)
+    const decoded = jwt.verify(token, jwtSecret, { algorithms: ["HS256"] });
     const authId = decoded.sub;
 
     // 2. Optional DB ownership check
