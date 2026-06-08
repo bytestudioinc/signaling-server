@@ -10,6 +10,12 @@ const { createClient } = require("@supabase/supabase-js");
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+// Telegram Bot for queue alerts
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const TELEGRAM_COOLDOWN_MS = 45_000; // 45 seconds
+let lastTelegramSent = 0;
+
 let supabase = null;
 if (supabaseUrl && supabaseServiceKey) {
   supabase = createClient(supabaseUrl, supabaseServiceKey);
@@ -172,6 +178,66 @@ function removeFromAllBuckets(deviceId) {
     buckets[user.currentBucket].delete(deviceId);
     user.currentBucket = null;
   }
+}
+
+/**
+ * Sends a rate-limited Telegram alert with queue summary stats.
+ * Fire-and-forget — never blocks the socket response.
+ */
+function sendTelegramQueueAlert() {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  const now = Date.now();
+  if (now - lastTelegramSent < TELEGRAM_COOLDOWN_MS) return;
+  lastTelegramSent = now;
+
+  // Collect all waiting users from all buckets
+  let totalWaiting = 0;
+  let maleCount = 0;
+  let femaleCount = 0;
+  const prefCounts = { any: 0, male: 0, female: 0 };
+
+  for (const [key, bucket] of Object.entries(buckets)) {
+    const count = bucket.size;
+    totalWaiting += count;
+    if (key.startsWith("M")) maleCount += count;
+    else if (key.startsWith("F")) femaleCount += count;
+
+    const prefChar = key.split("_")[1];
+    if (prefChar === "A") prefCounts.any += count;
+    else if (prefChar === "M") prefCounts.male += count;
+    else if (prefChar === "F") prefCounts.female += count;
+  }
+
+  if (totalWaiting === 0) return; // no point alerting for empty queue
+
+  const pct = (n) => totalWaiting ? Math.round((n / totalWaiting) * 100) : 0;
+
+  const lines = [
+    `🔔 Matchmaking Queue Alert`,
+    ``,
+    `👥 Users waiting: ${totalWaiting}`,
+    ``,
+    `⚧ Gender:`,
+    `  Male: ${maleCount} (${pct(maleCount)}%)`,
+    `  Female: ${femaleCount} (${pct(femaleCount)}%)`,
+    ``,
+    `🎯 Preference:`,
+    `  Any: ${prefCounts.any} (${pct(prefCounts.any)}%)`,
+    `  Male: ${prefCounts.male} (${pct(prefCounts.male)}%)`,
+    `  Female: ${prefCounts.female} (${pct(prefCounts.female)}%)`,
+    ``,
+    `⏰ ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`,
+  ];
+
+  const text = lines.join("\n");
+
+  fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, disable_notification: false }),
+  }).catch((err) => {
+    console.error("⚠️ Telegram alert failed:", err.message);
+  });
 }
 
 function findMatch(socket, userData, deviceId) {
@@ -358,6 +424,9 @@ io.on("connection", (socket) => {
       user.timeout = timeout;
       user.currentBucket = bucketKey;
       socket.emit("status", { status: "searching", message: "Searching for a partner..." });
+
+      // 🔔 Send Telegram alert (rate-limited) when someone is waiting
+      sendTelegramQueueAlert();
     }
   });
 
