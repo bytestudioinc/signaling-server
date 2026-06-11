@@ -82,6 +82,9 @@ async function sendFcmNotification(fcmToken, title, body, dataPayload = {}) {
     const projectId = sa.project_id;
     const accessToken = await getGoogleAccessToken(serviceAccountJson);
 
+    // Use data-only payload so the client's background handler receives it on Android.
+    // With a `notification` field, Android delivers it directly to the system tray,
+    // bypassing setBackgroundMessageHandler and losing deep-link data.
     const response = await fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`, {
       method: "POST",
       headers: {
@@ -91,22 +94,23 @@ async function sendFcmNotification(fcmToken, title, body, dataPayload = {}) {
       body: JSON.stringify({
         message: {
           token: fcmToken,
-          notification: {
-            title,
-            body,
+          data: {
+            ...dataPayload,
+            title: title || "Sparq",
+            body: body || "",
           },
-          data: dataPayload,
           android: {
             priority: "HIGH",
-            notification: {
-              sound: "default",
-              channelId: "default",
-            }
           },
           apns: {
             payload: {
               aps: {
+                "content-available": 1,
                 sound: "default",
+                alert: {
+                  title: title || "Sparq",
+                  body: body || "",
+                },
               }
             }
           }
@@ -279,6 +283,22 @@ function removeFromAllBuckets(deviceId) {
     buckets[user.currentBucket].delete(deviceId);
     user.currentBucket = null;
   }
+}
+
+function cleanDeleteRoom(roomId) {
+  if (!roomId || !rooms.has(roomId)) return;
+  const room = rooms.get(roomId);
+  if (room.cleanupTimer) {
+    clearTimeout(room.cleanupTimer);
+    room.cleanupTimer = null;
+  }
+  rooms.delete(roomId);
+  
+  // Clear room ID for both members in userRegistry
+  room.members.forEach(mId => {
+    const u = userRegistry.get(mId);
+    if (u) u.roomId = null;
+  });
 }
 
 /**
@@ -475,23 +495,38 @@ io.on("connection", (socket) => {
 
   socket.on("join_room", (data) => {
     const { roomId } = data;
-    if (roomId && rooms.has(roomId)) {
-      socket.join(roomId);
-      console.log(`👤 Socket ${socket.id} joined room ${roomId}`);
+    if (roomId) {
+      if (rooms.has(roomId)) {
+        socket.join(roomId);
+        console.log(`👤 Socket ${socket.id} joined room ${roomId}`);
 
-      const room = rooms.get(roomId);
-      const partnerId = room.members.find(id => id !== deviceId);
-      const partner = userRegistry.get(partnerId);
+        const room = rooms.get(roomId);
+        
+        // Clear cleanup timer as one member is back
+        if (room.cleanupTimer) {
+          console.log(`⏳ Cancelling room cleanup for ${roomId}`);
+          clearTimeout(room.cleanupTimer);
+          room.cleanupTimer = null;
+        }
 
-      socket.emit("room_restored", {
-        roomId,
-        partner: partner ? {
-          name: partner.userData.name,
-          gender: partner.userData.gender,
-          deviceId: partnerId
-        } : null,
-        messages: room.messages || []
-      });
+        const partnerId = room.members.find(id => id !== deviceId);
+        const partner = userRegistry.get(partnerId);
+
+        socket.emit("room_restored", {
+          roomId,
+          partner: partner ? {
+            name: partner.userData.name,
+            gender: partner.userData.gender,
+            deviceId: partnerId
+          } : null,
+          messages: room.messages || []
+        });
+        
+        socket.to(roomId).emit("chat_response", { status: "partner_connected", message: "Partner is back online." });
+      } else {
+        // Room expired or not found — notify the client
+        socket.emit("chat_response", { status: "partner_left", message: "This chat room has expired." });
+      }
     }
   });
 
@@ -510,8 +545,11 @@ io.on("connection", (socket) => {
       // If they were in a room, they are choosing to leave it
       if (existing.roomId) {
         const roomId = existing.roomId;
-        socket.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner started a new search." });
-        rooms.delete(roomId);
+        if (rooms.has(roomId)) {
+          socket.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner started a new search." });
+          io.in(roomId).socketsLeave(roomId);
+          cleanDeleteRoom(roomId);
+        }
         existing.roomId = null;
       }
     } else {
@@ -569,14 +607,18 @@ io.on("connection", (socket) => {
 
       io.to(roomId).emit("chat_response", msg);
 
-      // Deliver push notification if partner is offline/away
+      // Deliver push notification if partner is offline OR away (backgrounded)
       const partnerDeviceId = room.members.find(id => id !== senderDeviceId);
       if (partnerDeviceId) {
         const partnerSocketId = deviceToSocket.get(partnerDeviceId);
         const partnerUser = userRegistry.get(partnerDeviceId);
-        const isPartnerOffline = !partnerSocketId || (partnerUser && !partnerUser.isOnline);
+        // Push when: (a) partner has no active socket, (b) partner is marked offline, 
+        // or (c) partner is still connected but "away" (app backgrounded, within grace period)
+        const isPartnerUnavailable = !partnerSocketId || 
+          (partnerUser && !partnerUser.isOnline) ||
+          (partnerSocketId && !io.sockets.sockets.has(partnerSocketId));
 
-        if (isPartnerOffline && supabase) {
+        if (isPartnerUnavailable && supabase) {
           supabase
             .from("profiles")
             .select("fcm_token")
@@ -638,7 +680,7 @@ io.on("connection", (socket) => {
     if (roomId && rooms.has(roomId)) {
       socket.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner left the chat." });
       io.in(roomId).socketsLeave(roomId);
-      rooms.delete(roomId);
+      cleanDeleteRoom(roomId);
     }
     if (deviceId) {
       const user = userRegistry.get(deviceId);
@@ -697,17 +739,16 @@ io.on("connection", (socket) => {
           message: "Partner disconnected. Waiting for reconnection..." 
         });
 
+        // Clear existing cleanupTimer first to avoid memory leaks/races!
+        if (room.cleanupTimer) {
+          clearTimeout(room.cleanupTimer);
+        }
+
         // Set a timer to cleanup the room
         room.cleanupTimer = setTimeout(() => {
           console.log(`🧹 Grace period expired. Cleaning up room ${roomId}`);
           io.to(roomId).emit("chat_response", { status: "partner_left", message: "Your partner left the chat." });
-          rooms.delete(roomId);
-          
-          // Clear room ID for both members
-          room.members.forEach(mId => {
-            const u = userRegistry.get(mId);
-            if (u) u.roomId = null;
-          });
+          cleanDeleteRoom(roomId);
         }, DISCONNECT_GRACE_PERIOD);
       }
     }
