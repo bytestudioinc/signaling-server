@@ -24,6 +24,107 @@ if (supabaseUrl && supabaseServiceKey) {
   console.warn("⚠️ Supabase URL or Service Role Key missing. Database validation skipped.");
 }
 
+let cachedGoogleToken = null;
+let cachedGoogleTokenExpiry = 0;
+
+async function getGoogleAccessToken(serviceAccountJson) {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedGoogleToken && now < cachedGoogleTokenExpiry - 60) {
+    return cachedGoogleToken;
+  }
+
+  const sa = JSON.parse(serviceAccountJson);
+  
+  const header = { alg: "RS256", typ: "JWT" };
+  const claim = {
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now,
+  };
+
+  const jwtToken = jwt.sign(claim, sa.private_key, { algorithm: 'RS256', header });
+
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwtToken,
+    }),
+  });
+
+  if (!tokenResponse.ok) {
+    const errorBody = await tokenResponse.text();
+    throw new Error(`Failed to exchange JWT for Google Access Token: ${errorBody}`);
+  }
+
+  const tokenData = await tokenResponse.json();
+  if (!tokenData.access_token) {
+    throw new Error("No access_token returned by Google OAuth endpoint");
+  }
+
+  cachedGoogleToken = tokenData.access_token;
+  cachedGoogleTokenExpiry = now + (tokenData.expires_in || 3600);
+  return cachedGoogleToken;
+}
+
+async function sendFcmNotification(fcmToken, title, body, dataPayload = {}) {
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!serviceAccountJson) {
+    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT environment variable is not configured. Skipping push notification.");
+    return;
+  }
+
+  try {
+    const sa = JSON.parse(serviceAccountJson);
+    const projectId = sa.project_id;
+    const accessToken = await getGoogleAccessToken(serviceAccountJson);
+
+    const response = await fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        message: {
+          token: fcmToken,
+          notification: {
+            title,
+            body,
+          },
+          data: dataPayload,
+          android: {
+            priority: "HIGH",
+            notification: {
+              sound: "default",
+              channelId: "default",
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: "default",
+              }
+            }
+          }
+        }
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[sendFcmNotification] FCM error response:", errorText);
+    } else {
+      console.log(`✅ Push notification sent successfully to token: ${fcmToken.slice(0, 10)}...`);
+    }
+  } catch (err) {
+    console.error("[sendFcmNotification] Failed to send push notification:", err.message);
+  }
+}
+
 const app = express();
 const server = http.createServer(app);
 
@@ -279,7 +380,7 @@ function findMatch(socket, userData, deviceId) {
         socket.join(roomId);
         partnerSocket.join(roomId);
         
-        rooms.set(roomId, { members: [deviceId, partnerDeviceId], cleanupTimer: null });
+        rooms.set(roomId, { members: [deviceId, partnerDeviceId], messages: [], cleanupTimer: null });
         
         // Update registry
         const me = userRegistry.get(deviceId);
@@ -365,7 +466,8 @@ io.on("connection", (socket) => {
           name: partner.userData.name,
           gender: partner.userData.gender,
           deviceId: partnerId
-        } : null
+        } : null,
+        messages: room.messages || []
       });
       socket.to(user.roomId).emit("chat_response", { status: "partner_connected", message: "Partner is back online." });
     }
@@ -376,6 +478,20 @@ io.on("connection", (socket) => {
     if (roomId && rooms.has(roomId)) {
       socket.join(roomId);
       console.log(`👤 Socket ${socket.id} joined room ${roomId}`);
+
+      const room = rooms.get(roomId);
+      const partnerId = room.members.find(id => id !== deviceId);
+      const partner = userRegistry.get(partnerId);
+
+      socket.emit("room_restored", {
+        roomId,
+        partner: partner ? {
+          name: partner.userData.name,
+          gender: partner.userData.gender,
+          deviceId: partnerId
+        } : null,
+        messages: room.messages || []
+      });
     }
   });
 
@@ -433,12 +549,72 @@ io.on("connection", (socket) => {
   socket.on("chat_message", (data) => {
     const { roomId } = data;
     if (roomId && rooms.has(roomId)) {
-      io.to(roomId).emit("chat_response", {
+      const senderDeviceId = socketToDevice.get(socket.id);
+      const msg = {
+        id: crypto.randomUUID(),
         ...data,
         from: socket.id,
-        fromDeviceId: socketToDevice.get(socket.id),
+        fromDeviceId: senderDeviceId,
         timestamp: new Date().toISOString()
-      });
+      };
+
+      const room = rooms.get(roomId);
+      if (!room.messages) {
+        room.messages = [];
+      }
+      room.messages.push(msg);
+      if (room.messages.length > 100) {
+        room.messages.shift();
+      }
+
+      io.to(roomId).emit("chat_response", msg);
+
+      // Deliver push notification if partner is offline/away
+      const partnerDeviceId = room.members.find(id => id !== senderDeviceId);
+      if (partnerDeviceId) {
+        const partnerSocketId = deviceToSocket.get(partnerDeviceId);
+        const partnerUser = userRegistry.get(partnerDeviceId);
+        const isPartnerOffline = !partnerSocketId || (partnerUser && !partnerUser.isOnline);
+
+        if (isPartnerOffline && supabase) {
+          supabase
+            .from("profiles")
+            .select("fcm_token")
+            .eq("id", partnerDeviceId)
+            .maybeSingle()
+            .then(({ data: partnerProfile }) => {
+              if (partnerProfile && partnerProfile.fcm_token) {
+                // Fetch sender name
+                supabase
+                  .from("profiles")
+                  .select("name")
+                  .eq("id", senderDeviceId)
+                  .maybeSingle()
+                  .then(({ data: senderProfile }) => {
+                    const senderName = senderProfile?.name || "Someone";
+                    let bodyText = "Sent a message";
+                    if (msg.content) {
+                      bodyText = msg.content;
+                    } else if (msg.imageUri) {
+                      bodyText = "📷 Sent an image";
+                    } else if (msg.audioUri) {
+                      bodyText = "🎵 Sent a voice note";
+                    }
+
+                    sendFcmNotification(partnerProfile.fcm_token, senderName, bodyText, {
+                      screen: "chat",
+                      roomId: roomId,
+                      strangerDeviceId: senderDeviceId || "",
+                      strangerName: senderName,
+                    });
+                  });
+              }
+            })
+            .catch(err => {
+              console.error("[server.js] Error delivering push notification:", err);
+            });
+        }
+      }
     }
   });
 
