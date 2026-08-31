@@ -24,108 +24,36 @@ if (supabaseUrl && supabaseServiceKey) {
   console.warn("⚠️ Supabase URL or Service Role Key missing. Database validation skipped.");
 }
 
-let cachedGoogleToken = null;
-let cachedGoogleTokenExpiry = 0;
+const { Expo } = require("expo-server-sdk");
+const expo = new Expo();
 
-async function getGoogleAccessToken(serviceAccountJson) {
-  const now = Math.floor(Date.now() / 1000);
-  if (cachedGoogleToken && now < cachedGoogleTokenExpiry - 60) {
-    return cachedGoogleToken;
-  }
+async function sendExpoPushNotification(pushToken, title, body, dataPayload = {}) {
+  if (!pushToken) return;
 
-  const sa = JSON.parse(serviceAccountJson);
-  
-  const header = { alg: "RS256", typ: "JWT" };
-  const claim = {
-    iss: sa.client_email,
-    scope: "https://www.googleapis.com/auth/firebase.messaging",
-    aud: "https://oauth2.googleapis.com/token",
-    exp: now + 3600,
-    iat: now,
-  };
-
-  const jwtToken = jwt.sign(claim, sa.private_key, { algorithm: 'RS256', header });
-
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion: jwtToken,
-    }),
-  });
-
-  if (!tokenResponse.ok) {
-    const errorBody = await tokenResponse.text();
-    throw new Error(`Failed to exchange JWT for Google Access Token: ${errorBody}`);
-  }
-
-  const tokenData = await tokenResponse.json();
-  if (!tokenData.access_token) {
-    throw new Error("No access_token returned by Google OAuth endpoint");
-  }
-
-  cachedGoogleToken = tokenData.access_token;
-  cachedGoogleTokenExpiry = now + (tokenData.expires_in || 3600);
-  return cachedGoogleToken;
-}
-
-async function sendFcmNotification(fcmToken, title, body, dataPayload = {}) {
-  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!serviceAccountJson) {
-    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT environment variable is not configured. Skipping push notification.");
+  if (!Expo.isExpoPushToken(pushToken)) {
+    console.warn(`⚠️ [sendExpoPushNotification] Invalid Expo push token: ${pushToken}`);
     return;
   }
 
   try {
-    const sa = JSON.parse(serviceAccountJson);
-    const projectId = sa.project_id;
-    const accessToken = await getGoogleAccessToken(serviceAccountJson);
+    const messages = [{
+      to: pushToken,
+      sound: "default",
+      title: title || "Sparq",
+      body: body || "",
+      data: dataPayload,
+      priority: "high",
+      channelId: "default",
+      _displayInForeground: true,
+    }];
 
-    // Use data-only payload so the client's background handler receives it on Android.
-    // With a `notification` field, Android delivers it directly to the system tray,
-    // bypassing setBackgroundMessageHandler and losing deep-link data.
-    const response = await fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify({
-        message: {
-          token: fcmToken,
-          data: {
-            ...dataPayload,
-            title: title || "Sparq",
-            body: body || "",
-          },
-          android: {
-            priority: "HIGH",
-          },
-          apns: {
-            payload: {
-              aps: {
-                "content-available": 1,
-                sound: "default",
-                alert: {
-                  title: title || "Sparq",
-                  body: body || "",
-                },
-              }
-            }
-          }
-        }
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("[sendFcmNotification] FCM error response:", errorText);
-    } else {
-      console.log(`✅ Push notification sent successfully to token: ${fcmToken.slice(0, 10)}...`);
+    const chunks = expo.chunkPushNotifications(messages);
+    for (const chunk of chunks) {
+      const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
+      console.log(`✅ Push notification dispatched to token: ${pushToken.slice(0, 15)}...`, ticketChunk);
     }
   } catch (err) {
-    console.error("[sendFcmNotification] Failed to send push notification:", err.message);
+    console.error("[sendExpoPushNotification] Failed to send push notification:", err.message);
   }
 }
 
@@ -400,7 +328,15 @@ function findMatch(socket, userData, deviceId) {
         socket.join(roomId);
         partnerSocket.join(roomId);
         
-        rooms.set(roomId, { members: [deviceId, partnerDeviceId], messages: [], cleanupTimer: null });
+        rooms.set(roomId, {
+          members: [deviceId, partnerDeviceId],
+          pushTokens: {
+            [deviceId]: userData.pushToken || null,
+            [partnerDeviceId]: partner.userData?.pushToken || null
+          },
+          messages: [],
+          cleanupTimer: null
+        });
         
         // Update registry
         const me = userRegistry.get(deviceId);
@@ -413,7 +349,8 @@ function findMatch(socket, userData, deviceId) {
           partner: { 
             name: partner.userData.name, 
             gender: partner.userData.gender, 
-            deviceId: partnerDeviceId 
+            deviceId: partnerDeviceId,
+            pushToken: partner.userData?.pushToken || null
           }
         };
 
@@ -423,7 +360,8 @@ function findMatch(socket, userData, deviceId) {
           partner: { 
             name: userData.name, 
             gender: userData.gender, 
-            deviceId: deviceId 
+            deviceId: deviceId,
+            pushToken: userData?.pushToken || null
           }
         };
 
@@ -485,7 +423,8 @@ io.on("connection", (socket) => {
         partner: partner ? {
           name: partner.userData.name,
           gender: partner.userData.gender,
-          deviceId: partnerId
+          deviceId: partnerId,
+          pushToken: room.pushTokens?.[partnerId] || partner.userData?.pushToken || null
         } : null,
         messages: room.messages || []
       });
@@ -517,7 +456,8 @@ io.on("connection", (socket) => {
           partner: partner ? {
             name: partner.userData.name,
             gender: partner.userData.gender,
-            deviceId: partnerId
+            deviceId: partnerId,
+            pushToken: room.pushTokens?.[partnerId] || partner.userData?.pushToken || null
           } : null,
           messages: room.messages || []
         });
@@ -534,7 +474,7 @@ io.on("connection", (socket) => {
     const deviceId = socketToDevice.get(socket.id);
     if (!deviceId) return;
 
-    console.log(`🔍 Search: ${deviceId} (${data.gender} -> ${data.preference})`);
+    console.log(`🔍 Search: ${deviceId} (${data.gender} -> ${data.preference}, pushToken: ${data.pushToken ? "present" : "none"})`);
 
     // Clean up existing search or room
     if (userRegistry.has(deviceId)) {
@@ -552,6 +492,8 @@ io.on("connection", (socket) => {
         }
         existing.roomId = null;
       }
+      existing.userData = data;
+      existing.isOnline = true;
     } else {
       userRegistry.set(deviceId, { userData: data, isOnline: true });
     }
@@ -570,7 +512,7 @@ io.on("connection", (socket) => {
             socket.emit("status", { status: "timeout", message: msg });
           }
         }
-      }, 30000);
+      }, 60000);
 
       buckets[bucketKey].add(deviceId);
       const user = userRegistry.get(deviceId);
@@ -618,43 +560,27 @@ io.on("connection", (socket) => {
           (partnerUser && !partnerUser.isOnline) ||
           (partnerSocketId && !io.sockets.sockets.has(partnerSocketId));
 
-        if (isPartnerUnavailable && supabase) {
-          supabase
-            .from("profiles")
-            .select("fcm_token")
-            .eq("id", partnerDeviceId)
-            .maybeSingle()
-            .then(({ data: partnerProfile }) => {
-              if (partnerProfile && partnerProfile.fcm_token) {
-                // Fetch sender name
-                supabase
-                  .from("profiles")
-                  .select("name")
-                  .eq("id", senderDeviceId)
-                  .maybeSingle()
-                  .then(({ data: senderProfile }) => {
-                    const senderName = senderProfile?.name || "Someone";
-                    let bodyText = "Sent a message";
-                    if (msg.content) {
-                      bodyText = msg.content;
-                    } else if (msg.imageUri) {
-                      bodyText = "📷 Sent an image";
-                    } else if (msg.audioUri) {
-                      bodyText = "🎵 Sent a voice note";
-                    }
+        if (isPartnerUnavailable) {
+          const partnerPushToken = room.pushTokens?.[partnerDeviceId] || partnerUser?.userData?.pushToken;
+          if (partnerPushToken) {
+            const senderUser = userRegistry.get(senderDeviceId);
+            const senderName = senderUser?.userData?.name || "Someone";
+            let bodyText = "Sent a message";
+            if (msg.content) {
+              bodyText = msg.content;
+            } else if (msg.imageUri) {
+              bodyText = "📷 Sent an image";
+            } else if (msg.audioUri) {
+              bodyText = "🎵 Sent a voice note";
+            }
 
-                    sendFcmNotification(partnerProfile.fcm_token, senderName, bodyText, {
-                      screen: "chat",
-                      roomId: roomId,
-                      strangerDeviceId: senderDeviceId || "",
-                      strangerName: senderName,
-                    });
-                  });
-              }
-            })
-            .catch(err => {
-              console.error("[server.js] Error delivering push notification:", err);
+            sendExpoPushNotification(partnerPushToken, senderName, bodyText, {
+              screen: "chat",
+              roomId: roomId,
+              strangerDeviceId: senderDeviceId || "",
+              strangerName: senderName,
             });
+          }
         }
       }
     }
