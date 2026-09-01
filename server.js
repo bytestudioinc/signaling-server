@@ -526,7 +526,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("chat_message", (data) => {
+  socket.on("chat_message", async (data) => {
     const { roomId } = data;
     if (roomId && rooms.has(roomId)) {
       const senderDeviceId = socketToDevice.get(socket.id);
@@ -562,6 +562,7 @@ io.on("connection", (socket) => {
 
         if (isPartnerUnavailable) {
           const partnerPushToken = room.pushTokens?.[partnerDeviceId] || partnerUser?.userData?.pushToken;
+
           if (partnerPushToken) {
             const senderUser = userRegistry.get(senderDeviceId);
             const senderName = senderUser?.userData?.name || "Someone";
@@ -574,12 +575,15 @@ io.on("connection", (socket) => {
               bodyText = "🎵 Sent a voice note";
             }
 
+            console.log(`🔔 [Push Notification] Dispatching Expo push to partner ${partnerDeviceId} (Token: ${partnerPushToken.slice(0, 15)}...): "${bodyText}"`);
             sendExpoPushNotification(partnerPushToken, senderName, bodyText, {
               screen: "chat",
               roomId: roomId,
               strangerDeviceId: senderDeviceId || "",
               strangerName: senderName,
             });
+          } else {
+            console.log(`ℹ️ [Push Notification] Push skipped: No in-memory push token for partner ${partnerDeviceId} (not sent with find event).`);
           }
         }
       }
