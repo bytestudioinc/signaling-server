@@ -602,11 +602,13 @@ io.on("connection", (socket) => {
             }
 
             console.log(`🔔 [Push Notification] Dispatching Expo push to partner ${partnerDeviceId} (Token: ${partnerPushToken.slice(0, 15)}...): "${bodyText}"`);
-            sendExpoPushNotification(partnerPushToken, senderName, bodyText, {
+            // Use anonymous title "Stranger" so the real name is never leaked in the notification banner
+            sendExpoPushNotification(partnerPushToken, "Stranger", bodyText, {
               screen: "chat",
               roomId: roomId,
               strangerDeviceId: senderDeviceId || "",
               strangerName: senderName,
+              strangerGender: senderUser?.userData?.gender || "other",
             });
           } else {
             console.log(`ℹ️ [Push Notification] Push skipped: No push token found for partner ${partnerDeviceId}.`);
