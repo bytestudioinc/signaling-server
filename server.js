@@ -340,6 +340,10 @@ function findMatch(socket, userData, deviceId) {
             [deviceId]: userData.pushToken || null,
             [partnerDeviceId]: partner.userData?.pushToken || null
           },
+          revealedProfiles: {
+            [deviceId]: false,
+            [partnerDeviceId]: false
+          },
           messages: [],
           cleanupTimer: null
         });
@@ -432,6 +436,7 @@ io.on("connection", (socket) => {
           deviceId: partnerId,
           pushToken: room.pushTokens?.[partnerId] || partner.userData?.pushToken || null
         } : null,
+        profileRevealed: room.revealedProfiles?.[deviceId] === true,
         messages: room.messages || []
       });
       socket.to(user.roomId).emit("chat_response", { status: "partner_connected", message: "Partner is back online." });
@@ -465,6 +470,7 @@ io.on("connection", (socket) => {
             deviceId: partnerId,
             pushToken: room.pushTokens?.[partnerId] || partner.userData?.pushToken || null
           } : null,
+          profileRevealed: room.revealedProfiles?.[deviceId] === true,
           messages: room.messages || []
         });
         
@@ -601,9 +607,12 @@ io.on("connection", (socket) => {
               bodyText = "🎵 Sent a voice note";
             }
 
-            console.log(`🔔 [Push Notification] Dispatching Expo push to partner ${partnerDeviceId} (Token: ${partnerPushToken.slice(0, 15)}...): "${bodyText}"`);
-            // Use anonymous title "Stranger" so the real name is never leaked in the notification banner
-            sendExpoPushNotification(partnerPushToken, "Stranger", bodyText, {
+            // If the partner has unlocked/revealed the sender's profile, show the sender's real name; otherwise show "Stranger"
+            const isRevealed = room.revealedProfiles?.[partnerDeviceId] === true;
+            const notificationTitle = isRevealed ? senderName : "Stranger";
+
+            console.log(`🔔 [Push Notification] Dispatching Expo push to partner ${partnerDeviceId} (Token: ${partnerPushToken.slice(0, 15)}..., Title: "${notificationTitle}", Revealed: ${isRevealed}): "${bodyText}"`);
+            sendExpoPushNotification(partnerPushToken, notificationTitle, bodyText, {
               screen: "chat",
               roomId: roomId,
               strangerDeviceId: senderDeviceId || "",
@@ -615,6 +624,19 @@ io.on("connection", (socket) => {
           }
         }
       }
+    }
+  });
+
+  socket.on("reveal_profile", (data) => {
+    const deviceId = socketToDevice.get(socket.id);
+    const roomId = data?.roomId;
+    if (roomId && rooms.has(roomId) && deviceId) {
+      const room = rooms.get(roomId);
+      if (!room.revealedProfiles) {
+        room.revealedProfiles = {};
+      }
+      room.revealedProfiles[deviceId] = true;
+      console.log(`👁️ [Profile Reveal] Device ${deviceId} revealed partner profile in room ${roomId}`);
     }
   });
 
