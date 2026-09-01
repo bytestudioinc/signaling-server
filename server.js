@@ -50,7 +50,13 @@ async function sendExpoPushNotification(pushToken, title, body, dataPayload = {}
     const chunks = expo.chunkPushNotifications(messages);
     for (const chunk of chunks) {
       const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
-      console.log(`✅ Push notification dispatched to token: ${pushToken.slice(0, 15)}...`, ticketChunk);
+      for (const ticket of ticketChunk) {
+        if (ticket.status === "error") {
+          console.error(`❌ [sendExpoPushNotification] Push ticket error: ${ticket.message}`, ticket.details || "");
+        } else {
+          console.log(`✅ [sendExpoPushNotification] Push ticket accepted: ${ticket.id} for token ${pushToken.slice(0, 15)}...`);
+        }
+      }
     }
   } catch (err) {
     console.error("[sendExpoPushNotification] Failed to send push notification:", err.message);
@@ -555,13 +561,33 @@ io.on("connection", (socket) => {
         const partnerSocketId = deviceToSocket.get(partnerDeviceId);
         const partnerUser = userRegistry.get(partnerDeviceId);
         // Push when: (a) partner has no active socket, (b) partner is marked offline, 
-        // or (c) partner is still connected but "away" (app backgrounded, within grace period)
+        // or (c) partner is still connected but marked away (app backgrounded, within grace period)
         const isPartnerUnavailable = !partnerSocketId || 
-          (partnerUser && !partnerUser.isOnline) ||
+          (partnerUser && (!partnerUser.isOnline || partnerUser.isAway)) ||
           (partnerSocketId && !io.sockets.sockets.has(partnerSocketId));
 
         if (isPartnerUnavailable) {
-          const partnerPushToken = room.pushTokens?.[partnerDeviceId] || partnerUser?.userData?.pushToken;
+          let partnerPushToken = room.pushTokens?.[partnerDeviceId] || partnerUser?.userData?.pushToken;
+
+          // If token not in memory, fallback to query Supabase profiles table
+          if (!partnerPushToken && supabase) {
+            try {
+              const { data: partnerProfile } = await supabase
+                .from("profiles")
+                .select("fcm_token")
+                .eq("id", partnerDeviceId)
+                .maybeSingle();
+
+              if (partnerProfile && partnerProfile.fcm_token) {
+                partnerPushToken = partnerProfile.fcm_token;
+                if (room.pushTokens) {
+                  room.pushTokens[partnerDeviceId] = partnerPushToken;
+                }
+              }
+            } catch (dbErr) {
+              console.error(`[Push Notification] DB fallback failed for ${partnerDeviceId}:`, dbErr.message);
+            }
+          }
 
           if (partnerPushToken) {
             const senderUser = userRegistry.get(senderDeviceId);
@@ -583,10 +609,20 @@ io.on("connection", (socket) => {
               strangerName: senderName,
             });
           } else {
-            console.log(`ℹ️ [Push Notification] Push skipped: No in-memory push token for partner ${partnerDeviceId} (not sent with find event).`);
+            console.log(`ℹ️ [Push Notification] Push skipped: No push token found for partner ${partnerDeviceId}.`);
           }
         }
       }
+    }
+  });
+
+  socket.on("app_state", (data) => {
+    const deviceId = socketToDevice.get(socket.id);
+    if (!deviceId) return;
+    const user = userRegistry.get(deviceId);
+    if (user) {
+      user.isAway = data?.state === "background" || data?.state === "inactive";
+      console.log(`📱 App state for ${deviceId}: ${data?.state} (isAway: ${user.isAway})`);
     }
   });
 
