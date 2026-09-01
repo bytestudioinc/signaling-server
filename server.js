@@ -44,7 +44,6 @@ async function sendExpoPushNotification(pushToken, title, body, dataPayload = {}
       data: dataPayload,
       priority: "high",
       channelId: "default",
-      _displayInForeground: true,
     }];
 
     const chunks = expo.chunkPushNotifications(messages);
@@ -409,38 +408,43 @@ io.on("connection", (socket) => {
   deviceToSocket.set(deviceId, socket.id);
 
   // Re-join active room if exists
-  const user = userRegistry.get(deviceId);
+  let user = userRegistry.get(deviceId);
   if (user) {
     user.isOnline = true;
-    if (user.roomId && rooms.has(user.roomId)) {
-      const room = rooms.get(user.roomId);
-      socket.join(user.roomId);
-      
-      // Clear cleanup timer as one member is back
-      if (room.cleanupTimer) {
-        console.log(`⏳ Cancelling room cleanup for ${user.roomId}`);
-        clearTimeout(room.cleanupTimer);
-        room.cleanupTimer = null;
-      }
+    user.isAway = false;
+  } else {
+    user = { userData: null, timeout: null, currentBucket: null, roomId: null, isOnline: true, isAway: false };
+    userRegistry.set(deviceId, user);
+  }
 
-      console.log(`🔗 Reconnected ${deviceId} to active room: ${user.roomId}`);
-      
-      const partnerId = room.members.find(id => id !== deviceId);
-      const partner = userRegistry.get(partnerId);
-      
-      socket.emit("room_restored", { 
-        roomId: user.roomId,
-        partner: partner ? {
-          name: partner.userData.name,
-          gender: partner.userData.gender,
-          deviceId: partnerId,
-          pushToken: room.pushTokens?.[partnerId] || partner.userData?.pushToken || null
-        } : null,
-        profileRevealed: room.revealedProfiles?.[deviceId] === true,
-        messages: room.messages || []
-      });
-      socket.to(user.roomId).emit("chat_response", { status: "partner_connected", message: "Partner is back online." });
+  if (user.roomId && rooms.has(user.roomId)) {
+    const room = rooms.get(user.roomId);
+    socket.join(user.roomId);
+    
+    // Clear cleanup timer as one member is back
+    if (room.cleanupTimer) {
+      console.log(`⏳ Cancelling room cleanup for ${user.roomId}`);
+      clearTimeout(room.cleanupTimer);
+      room.cleanupTimer = null;
     }
+
+    console.log(`🔗 Reconnected ${deviceId} to active room: ${user.roomId}`);
+    
+    const partnerId = room.members.find(id => id !== deviceId);
+    const partner = userRegistry.get(partnerId);
+    
+    socket.emit("room_restored", { 
+      roomId: user.roomId,
+      partner: partner ? {
+        name: partner.userData?.name || "Stranger",
+        gender: partner.userData?.gender || "other",
+        deviceId: partnerId,
+        pushToken: room.pushTokens?.[partnerId] || partner.userData?.pushToken || null
+      } : null,
+      profileRevealed: room.revealedProfiles?.[deviceId] === true,
+      messages: room.messages || []
+    });
+    socket.to(user.roomId).emit("chat_response", { status: "partner_connected", message: "Partner is back online." });
   }
 
   socket.on("join_room", (data) => {
@@ -643,11 +647,24 @@ io.on("connection", (socket) => {
   socket.on("app_state", (data) => {
     const deviceId = socketToDevice.get(socket.id);
     if (!deviceId) return;
-    const user = userRegistry.get(deviceId);
+    const isAway = data?.state === "background" || data?.state === "inactive";
+    let user = userRegistry.get(deviceId);
     if (user) {
-      user.isAway = data?.state === "background" || data?.state === "inactive";
-      console.log(`📱 App state for ${deviceId}: ${data?.state} (isAway: ${user.isAway})`);
+      user.isAway = isAway;
+      if (!isAway) {
+        user.isOnline = true;
+      }
+    } else {
+      userRegistry.set(deviceId, { 
+        userData: null, 
+        timeout: null, 
+        currentBucket: null, 
+        roomId: null, 
+        isOnline: !isAway, 
+        isAway 
+      });
     }
+    console.log(`📱 App state for ${deviceId}: ${data?.state} (isAway: ${isAway})`);
   });
 
   socket.on("typing", (data) => {
